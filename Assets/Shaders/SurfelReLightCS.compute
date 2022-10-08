@@ -1,0 +1,121 @@
+#pragma kernel CSMain
+
+#pragma multi_compile _ _MAIN_LIGHT_SHADOWS
+#pragma multi_compile _ _MAIN_LIGHT_SHADOWS_CASCADE
+#pragma multi_compile _ _SHADOWS_SOFT
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+#include "SH.hlsl"
+
+struct Surfel
+{
+    float3 position;
+    float3 normal;
+    float3 albedo;
+    float skyMask;
+};
+RWStructuredBuffer<Surfel> _surfels;
+RWStructuredBuffer<float3> _surfelRadiance; // for debug
+
+float _skyLightIntensity;
+float4 _probePos;
+
+// 使用定点数存储小数, 因为 compute shader 的 InterlockedAdd 不支持 float
+// array size: 3x9=27
+RWStructuredBuffer<int> _coefficientSH9;  
+
+// 探针组的球谐系数
+// array size: A x B x C x 27, 取决于 volume 的 size
+int _indexInProbeVolume;
+RWStructuredBuffer<int> _coefficientVoxel;  
+StructuredBuffer<int> _lastFrameCoefficientVoxel;
+float _GIIntensity;
+
+// volume param
+float _coefficientVoxelGridSize;
+float4 _coefficientVoxelCorner;
+float4 _coefficientVoxelSize;
+
+[numthreads(32,16,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint surfelIndex = id.x * 16 + id.y;
+    Surfel surfel = _surfels[surfelIndex];
+
+    // mainlight property
+    Light mainLight = GetMainLight();
+
+    // mainlight shadow mask in URP
+    float4 shadowCoord = TransformWorldToShadowCoord(surfel.position);
+    float atten = SampleShadowmap(
+        TEXTURE2D_ARGS(_MainLightShadowmapTexture, sampler_MainLightShadowmapTexture), 
+        shadowCoord, 
+        GetMainLightShadowSamplingData(), 
+        GetMainLightShadowParams(), 
+        false
+    );
+
+    // radiance from light
+    float NdotL = saturate(dot(surfel.normal, mainLight.direction));
+    float3 radiance = surfel.albedo * mainLight.color * NdotL * atten * (1.0 - surfel.skyMask);
+    
+    // direction from probe to surfel
+    float3 dir = normalize(surfel.position - _probePos.xyz);
+
+    // radiance from sky
+    float3 skyColor = SAMPLE_TEXTURECUBE_LOD(_GlossyEnvironmentCubeMap, sampler_GlossyEnvironmentCubeMap, dir, 0).rgb;
+    radiance += skyColor * surfel.skyMask * _skyLightIntensity;  
+
+    // radiance from last frame
+    float3 history = SampleSHVoxel(
+        float4(surfel.position, 1.0), 
+        surfel.albedo, 
+        surfel.normal,
+        _lastFrameCoefficientVoxel, 
+        _coefficientVoxelGridSize,
+        _coefficientVoxelCorner,
+        _coefficientVoxelSize
+    );
+    radiance += history * _GIIntensity;
+
+    // SH projection
+    const float N = 32 * 16;
+    float3 c[9];
+    c[0] = SH(0,  0, dir) * radiance * 4.0 * PI / N;
+    c[1] = SH(1, -1, dir) * radiance * 4.0 * PI / N;
+    c[2] = SH(1,  0, dir) * radiance * 4.0 * PI / N;
+    c[3] = SH(1,  1, dir) * radiance * 4.0 * PI / N;
+    c[4] = SH(2, -2, dir) * radiance * 4.0 * PI / N;
+    c[5] = SH(2, -1, dir) * radiance * 4.0 * PI / N;
+    c[6] = SH(2,  0, dir) * radiance * 4.0 * PI / N;
+    c[7] = SH(2,  1, dir) * radiance * 4.0 * PI / N;
+    c[8] = SH(2,  2, dir) * radiance * 4.0 * PI / N;
+
+    // atom write result to buffer
+    for(int i=0; i<9; i++)
+    {
+        InterlockedAdd(_coefficientSH9[i*3+0], EncodeFloatToInt(c[i].x));
+        InterlockedAdd(_coefficientSH9[i*3+1], EncodeFloatToInt(c[i].y));
+        InterlockedAdd(_coefficientSH9[i*3+2], EncodeFloatToInt(c[i].z));
+    }
+
+    /**/
+    // storage to volume
+    if(_indexInProbeVolume >= 0)
+    {
+        const int coefficientByteSize = 27;
+        int offset = _indexInProbeVolume * coefficientByteSize;
+        for(int i=0; i<9; i++)
+        {
+            InterlockedAdd(_coefficientVoxel[offset + i*3+0], EncodeFloatToInt(c[i].x));
+            InterlockedAdd(_coefficientVoxel[offset + i*3+1], EncodeFloatToInt(c[i].y));
+            InterlockedAdd(_coefficientVoxel[offset + i*3+2], EncodeFloatToInt(c[i].z));
+        }
+    }
+    
+
+    // for debug
+    _surfelRadiance[surfelIndex] = radiance;
+}
