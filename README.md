@@ -1,4 +1,9 @@
+Reading online：https://zhuanlan.zhihu.com/p/571673961
+
+
+
 # CasualPRT
+
 Precomputed Radiance Transfer Global Illumination in Unity URP
 
 ![image-20221009044706725](README.assets/image-20221009044706725.png)
